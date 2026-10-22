@@ -7,8 +7,10 @@ use crate::style::AvailableSpace;
 use crate::tree::{LayoutInput, LayoutOutput, RunMode};
 use crate::RequestedAxis;
 
-/// The number of cache entries for each node in the tree
+/// The number of sizing-mode buckets for each node in the tree
 const CACHE_SIZE: usize = 9;
+/// Retain alternating constraints within each sizing-mode bucket.
+const MEASURE_WAYS: usize = 2;
 
 // Manually written-out results of float to u32 bit casts because
 // `f32::to_bits` is not yet const at our MSRV.
@@ -30,10 +32,6 @@ const SIGN_BIT_2: u64 = 1u64 << 31;
 const BOTH_SIGN_BITS_MASK: u64 = SIGN_BIT_1 | SIGN_BIT_2;
 /// Mask of excluding the sign bits (used when setting/getting the size excluding the packed bits)
 const NON_SIGN_BITS_MASK: u64 = !BOTH_SIGN_BITS_MASK;
-
-/// Mask which includes only the bits which encode the x-axis value that we can use to ignore the
-/// y-axis value when comparing a cache key.
-const X_AXIS_VALUE_MASK: u64 = (u32::MAX as u64) << 32;
 
 /// Pack `Option<f32>` into `u32`
 #[inline(always)]
@@ -98,12 +96,6 @@ impl CacheKey {
     fn parent_size(&self) -> u64 {
         self.parent_size & NON_SIGN_BITS_MASK
     }
-
-    /// Return the parent size with the extra bits that encode the requested axis masked out
-    /// And the y-axis value masked out
-    fn x_axis_parent_size(&self) -> u64 {
-        self.parent_size & (X_AXIS_VALUE_MASK & NON_SIGN_BITS_MASK)
-    }
 }
 
 impl From<&LayoutInput> for CacheKey {
@@ -138,8 +130,8 @@ pub(crate) struct CacheEntry<T> {
 pub struct Cache {
     /// The cache entry for the node's final layout
     final_layout_entry: Option<CacheEntry<LayoutOutput>>,
-    /// The cache entries for the node's preliminary size measurements
-    measure_entries: [Option<CacheEntry<Size<f32>>>; CACHE_SIZE],
+    /// Preliminary size measurements, most recently stored first within each bucket.
+    measure_entries: [[Option<CacheEntry<Size<f32>>>; MEASURE_WAYS]; CACHE_SIZE],
     /// Tracks if all cache entries are empty
     is_empty: bool,
 }
@@ -153,7 +145,7 @@ impl Default for Cache {
 impl Cache {
     /// Create a new empty cache
     pub const fn new() -> Self {
-        Self { final_layout_entry: None, measure_entries: [None; CACHE_SIZE], is_empty: true }
+        Self { final_layout_entry: None, measure_entries: [[None; MEASURE_WAYS]; CACHE_SIZE], is_empty: true }
     }
 
     /// Return the cache slot to cache the current computed result in
@@ -162,6 +154,8 @@ impl Cache {
     ///
     /// We need multiple cache slots, because a node's size is often queried by it's parent multiple times in the course of the layout
     /// process, and we don't want later results to clobber earlier ones.
+    /// Each slot retains two distinct keys so alternating parent sizes or available-space
+    /// constraints do not immediately evict one another.
     ///
     /// The two variables that we care about when determining cache slot are:
     ///
@@ -227,10 +221,11 @@ impl Cache {
         match input.run_mode {
             RunMode::PerformLayout => self.final_layout_entry.filter(|entry| entry.key == key).map(|e| e.content),
             RunMode::ComputeSize => {
-                for entry in self.measure_entries.iter().flatten() {
-                    if entry.key.kd_available_space == key.kd_available_space
-                        && (entry.key.x_axis_parent_size() == key.x_axis_parent_size())
-                    {
+                let cache_slot = Self::compute_cache_slot(input.known_dimensions, input.available_space);
+                for entry in self.measure_entries[cache_slot].iter().flatten() {
+                    // Preserve both parent dimensions and the requested axis. More entries
+                    // improve reuse without treating different layout inputs as equivalent.
+                    if entry.key == key {
                         return Some(LayoutOutput::from_outer_size(entry.content));
                     }
                 }
@@ -252,7 +247,13 @@ impl Cache {
             RunMode::ComputeSize => {
                 self.is_empty = false;
                 let cache_slot = Self::compute_cache_slot(input.known_dimensions, input.available_space);
-                self.measure_entries[cache_slot] = Some(CacheEntry { key, content: layout_output.size });
+                let entries = &mut self.measure_entries[cache_slot];
+                let replace = entries
+                    .iter()
+                    .position(|entry| entry.as_ref().map_or(true, |entry| entry.key == key))
+                    .unwrap_or(MEASURE_WAYS - 1);
+                entries[..=replace].rotate_right(1);
+                entries[0] = Some(CacheEntry { key, content: layout_output.size });
             }
             RunMode::PerformHiddenLayout => {}
         }
@@ -265,13 +266,13 @@ impl Cache {
         }
         self.is_empty = true;
         self.final_layout_entry = None;
-        self.measure_entries = [None; CACHE_SIZE];
+        self.measure_entries = [[None; MEASURE_WAYS]; CACHE_SIZE];
         ClearState::Cleared
     }
 
     /// Returns true if all cache entries are None, else false
     pub fn is_empty(&self) -> bool {
-        self.final_layout_entry.is_none() && !self.measure_entries.iter().any(|entry| entry.is_some())
+        self.final_layout_entry.is_none() && !self.measure_entries.iter().flatten().any(|entry| entry.is_some())
     }
 }
 
